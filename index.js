@@ -16,7 +16,7 @@ async function saveWithRetry(sheet, retries = 3) {
     for (let i = 0; i < retries; i++) {
         try {
             await sheet.saveUpdatedCells();
-            return;
+            return; 
         } catch (error) {
             if (i === retries - 1) {
                 console.error("❌ Max retries reached. Google API remains unavailable.");
@@ -30,10 +30,10 @@ async function saveWithRetry(sheet, retries = 3) {
 }
 
 // =========================================================
-// 2. CORE SCRAPER ENGINE (Zillow Rentals w/ Direct Fallbacks)
+// 2. CORE SCRAPER ENGINE (Zillow Rentals Edition)
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting Stealth Scraper V14 (Agent-Card-Wait Fix)...");
+    console.log("🚀 Starting Stealth Scraper V13 (Zillow Rentals / FSBO Cache Extraction)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -46,10 +46,10 @@ async function runScraper() {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
-    // Expanded to 24 to add "Listed By Type" (DOM Fallback)
-    if (sheet.columnCount < 24) {
-        console.log(`📏 Expanding sheet columns from ${sheet.columnCount} to 24...`);
-        await sheet.resize({ rowCount: sheet.rowCount, columnCount: 24 });
+    // Ensure we have enough columns for the expanded rental layout (up to Column W / index 22)
+    if (sheet.columnCount < 23) {
+        console.log(`📏 Expanding sheet columns from ${sheet.columnCount} to 23...`);
+        await sheet.resize({ rowCount: sheet.rowCount, columnCount: 23 });
     }
 
     await sheet.loadCells();
@@ -61,17 +61,17 @@ async function runScraper() {
 
     let scrapeCount = 0;
     let rowsRemaining = false;
-    const FLUSH_BATCH_SIZE = 10;
+    const FLUSH_BATCH_SIZE = 10; 
     let stagedCellsToSave = [];
 
     // 3. Loop through rows (rowIndex = 1 skips the header)
     for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
 
         const originalUrl = sheet.getCell(rowIndex, 0).value; // Assuming links are in Column A
-        const status = sheet.getCell(rowIndex, 23).value || ""; // Status shifted to Column X (index 23)
+        const status = sheet.getCell(rowIndex, 22).value || ""; // Status shifted to Column W (index 22)
 
-        if (!originalUrl) continue;
-        if (!originalUrl.includes("zillow.com") || status.includes("✅")) continue;
+        if (!originalUrl) continue; 
+        if (!originalUrl.includes("zillow.com") || status.includes("✅")) continue; 
 
         if (scrapeCount >= 30) {
             console.log("🛑 Reached 30 rows. Shutting down to rotate runner environment...");
@@ -97,214 +97,64 @@ async function runScraper() {
             await delay(Math.floor(Math.random() * 500) + 500);
             await page.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-            let pageTitle = await page.title();
-
-            // ---------------------------------------------------------
-            // 3a. BLOCK-PAGE CHECK WITH ONE RELOAD ATTEMPT
-            // PerimeterX/bot-detection blocks can be transient — a single
-            // reload sometimes clears it before we give up on the row.
-            // ---------------------------------------------------------
-            if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
-                console.log(`   ⚠️ Possible block detected on Row ${actualRowNumber}. Reloading once before giving up...`);
-                await delay(2000 + Math.floor(Math.random() * 2000));
-                await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-                pageTitle = await page.title();
-            }
-
+            const pageTitle = await page.title();
             if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
                 console.log(`❌ BLOCKED: IP has been flagged on Row ${actualRowNumber}`);
-                sheet.getCell(rowIndex, 23).value = "❌ BLOCKED (IP Burned)";
+                sheet.getCell(rowIndex, 22).value = "❌ BLOCKED (IP Burned)";
                 await saveWithRetry(sheet);
                 await page.close();
                 continue;
             }
 
-            // ---------------------------------------------------------
-            // 3b. WAIT FOR THE LISTING-AGENT CARD TO HYDRATE
-            // Zillow server-renders a "Contact manager" PLACEHOLDER first,
-            // then swaps in the real agent card (.ds-listing-agent-*) via
-            // an async client-side call once it resolves. This swap can
-            // take longer than a few seconds, especially from datacenter
-            // IPs (GitHub Actions runners). Between attempts, RELOAD the
-            // page rather than just waiting longer on the same DOM —
-            // a stuck/failed async call often needs a fresh navigation
-            // to retrigger, and this also helps recover from soft-blocks.
-            // ---------------------------------------------------------
-            let agentCardFound = false;
-            const MAX_AGENT_WAIT_ATTEMPTS = 3;
-            for (let attempt = 1; attempt <= MAX_AGENT_WAIT_ATTEMPTS; attempt++) {
-                try {
-                    await page.waitForSelector(
-                        '.ds-listing-agent-display-name, .ds-listing-agent-business-name',
-                        { timeout: 12000 }
-                    );
-                    agentCardFound = true;
-                    break;
-                } catch (waitErr) {
-                    console.log(`   ⏳ Agent card not ready yet (attempt ${attempt}/${MAX_AGENT_WAIT_ATTEMPTS}) on Row ${actualRowNumber}.`);
-                    if (attempt < MAX_AGENT_WAIT_ATTEMPTS) {
-                        console.log(`   🔄 Reloading page before retrying...`);
-                        await delay(1500 + Math.floor(Math.random() * 1500));
-                        try {
-                            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-                        } catch (reloadErr) {
-                            console.log(`   ⚠️ Reload failed on Row ${actualRowNumber}: ${reloadErr.message}`);
-                        }
-                    }
-                }
-            }
-            if (!agentCardFound) {
-                console.log(`   ⚠️ Agent card never appeared after ${MAX_AGENT_WAIT_ATTEMPTS} attempts (with reloads) on Row ${actualRowNumber} — may genuinely be a Contact Manager listing.`);
-            }
-
-            // Small extra settle time so text content is fully populated.
-            await delay(500);
-
-            // 4. Extract Rental parameters from Next.js payload, DOM, and Redux Fallback
+            // 4. Extract Rental parameters from Next.js payload & Canonical Tag
             const extractedData = await page.evaluate(() => {
                 let data = {
                     canonicalUrl: document.querySelector('meta[property="og:url"]')?.content || "",
                     propertyDetails: { price: "N/A", street: "N/A", city: "N/A", state: "N/A", zipcode: "N/A", beds: "N/A", baths: "N/A", type: "N/A" },
-                    agentDetails: { listedByType: "N/A", name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A" }
+                    agentDetails: { name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A" }
                 };
-
-                // --- CHECK FOR "CONTACT MANAGER" FLOW (no named agent exists) ---
-                // Some listings (landlord/property-manager self-posted via
-                // Rental Manager) never show a named agent at all — instead
-                // showing "Contact manager for more details about this home."
-                // In that case there is nothing to scrape; label it clearly
-                // instead of leaving a misleading N/A.
-                try {
-                    const bodyText = document.body.innerText || "";
-                    const hasAgentCard = !!document.querySelector('[data-testid="listing-agent-container"], .ds-listing-agent-display-name');
-                    if (!hasAgentCard && /contact manager/i.test(bodyText)) {
-                        data.agentDetails.listedByType = "NO AGENT (Contact Manager Flow)";
-                        data.agentDetails.name = "N/A - Contact Manager";
-                        data.agentDetails.broker = "N/A - Contact Manager";
-                    }
-                } catch (e) {}
-
-                // --- FALLBACK 1: DIRECT DOM EXTRACTION (now hydration-safe) ---
-                try {
-                    const headerEl = document.querySelector('[data-testid="listing-agent-header"]');
-                    if (headerEl && headerEl.innerText.trim() !== "") {
-                        data.agentDetails.listedByType = headerEl.innerText.trim();
-                    }
-
-                    const domNameEl = document.querySelector('.ds-listing-agent-display-name');
-                    if (domNameEl && domNameEl.innerText.trim() !== "") {
-                        data.agentDetails.name = domNameEl.innerText.trim();
-                    }
-
-                    const domBrokerEl = document.querySelector('.ds-listing-agent-business-name');
-                    if (domBrokerEl && domBrokerEl.innerText.trim() !== "") {
-                        data.agentDetails.broker = domBrokerEl.innerText.trim();
-                    }
-
-                    // Some listings render a phone number as a further
-                    // <li> or <a href="tel:..."> inside the agent info list.
-                    const telAnchor = document.querySelector('[data-testid="listing-agent-container"] a[href^="tel:"]');
-                    if (telAnchor) {
-                        const rawTel = telAnchor.getAttribute('href').replace('tel:', '').trim();
-                        if (rawTel) data.agentDetails.phone = rawTel;
-                    }
-                } catch (e) {}
 
                 const nextDataScript = document.querySelector('script#__NEXT_DATA__');
                 if (!nextDataScript) return data;
 
                 try {
                     const jsonData = JSON.parse(nextDataScript.innerText);
+                    const rawCache = jsonData?.props?.pageProps?.componentProps?.gdpClientCache;
+                    if (!rawCache) return data;
 
-                    // --- ROUTE 1: SINGLE-LISTING RENTALS EXTRACTION ---
-                    try {
-                        const rawCache = jsonData?.props?.pageProps?.componentProps?.gdpClientCache;
-                        if (rawCache) {
-                            const parsedCache = JSON.parse(rawCache);
+                    const parsedCache = JSON.parse(rawCache);
+                    
+                    // Locate the rental specific query key
+                    const cacheKey = Object.keys(parsedCache).find(key => parsedCache[key]?.property);
+                    const p = parsedCache[cacheKey]?.property;
+                    
+                    if (!p) return data;
 
-                            const cacheKey = Object.keys(parsedCache).find(key => parsedCache[key]?.property);
-                            const p = parsedCache[cacheKey]?.property;
+                    // Extrapolate Property Details
+                    data.propertyDetails = {
+                        price: p.price || p.baseRent || "N/A",
+                        street: p.address?.streetAddress || p.streetAddress || "N/A",
+                        city: p.address?.city || p.city || "N/A",
+                        state: p.address?.state || p.state || "N/A",
+                        zipcode: p.address?.zipcode || p.zipcode || "N/A",
+                        beds: p.bedrooms ?? "N/A",
+                        baths: p.bathrooms ?? "N/A",
+                        type: p.homeType || "N/A"
+                    };
 
-                            if (p) {
-                                data.propertyDetails = {
-                                    price: p.price || p.baseRent || "N/A",
-                                    street: p.address?.streetAddress || p.streetAddress || "N/A",
-                                    city: p.address?.city || p.city || "N/A",
-                                    state: p.address?.state || p.state || "N/A",
-                                    zipcode: p.address?.zipcode || p.zipcode || "N/A",
-                                    beds: p.bedrooms ?? "N/A",
-                                    baths: p.bathrooms ?? "N/A",
-                                    type: p.homeType || "N/A"
-                                };
-
-                                // Only overwrite DOM-derived agent info if JSON has it
-                                // and the DOM pass didn't already find something.
-                                if (p.attributionInfo) {
-                                    if (data.agentDetails.name === "N/A" && p.attributionInfo.agentName) {
-                                        data.agentDetails.name = p.attributionInfo.agentName;
-                                    }
-                                    if (data.agentDetails.broker === "N/A" && p.attributionInfo.brokerName) {
-                                        data.agentDetails.broker = p.attributionInfo.brokerName;
-                                    }
-                                    if (data.agentDetails.phone === "N/A") {
-                                        data.agentDetails.phone = p.attributionInfo.agentPhoneNumber || "N/A";
-                                    }
-                                    data.agentDetails.brokerPhone = p.attributionInfo.brokerPhoneNumber || "N/A";
-                                    data.agentDetails.email = p.attributionInfo.agentEmail || "N/A";
-                                } else if (p.postingContact) {
-                                    if (data.agentDetails.name === "N/A" && p.postingContact.name) {
-                                        data.agentDetails.name = p.postingContact.name;
-                                    }
-                                    if (data.agentDetails.phone === "N/A") {
-                                        data.agentDetails.phone = p.postingContact.phoneNumber || "N/A";
-                                    }
-                                }
-                            }
-                        }
-                    } catch (e) {}
-
-                    // --- FALLBACK 2: BUILDING / APARTMENT-COMMUNITY PAGES ---
-                    // Only applies if Route 1 failed to grab a price
-                    try {
-                        const gdpBuilding = jsonData?.props?.pageProps?.initialReduxState?.gdp?.building;
-                        if (gdpBuilding && data.propertyDetails.price === "N/A") {
-                            let firstUnit = null;
-                            if (Array.isArray(gdpBuilding.ungroupedUnits) && gdpBuilding.ungroupedUnits.length) {
-                                firstUnit = gdpBuilding.ungroupedUnits[0];
-                            } else if (Array.isArray(gdpBuilding.floorPlans) && gdpBuilding.floorPlans.length) {
-                                const fp = gdpBuilding.floorPlans[0];
-                                firstUnit = (fp.units && fp.units[0]) || fp;
-                            }
-                            firstUnit = firstUnit || {};
-
-                            data.propertyDetails = {
-                                price: firstUnit.price ?? firstUnit.baseRent ?? "N/A",
-                                street: gdpBuilding.address?.streetAddress || gdpBuilding.streetAddress || "N/A",
-                                city: gdpBuilding.address?.city || gdpBuilding.city || "N/A",
-                                state: gdpBuilding.address?.state || gdpBuilding.state || "N/A",
-                                zipcode: gdpBuilding.address?.zipcode || gdpBuilding.zipcode || "N/A",
-                                beds: firstUnit.beds ?? "N/A",
-                                baths: firstUnit.baths ?? "N/A",
-                                type: gdpBuilding.buildingType || "Building"
-                            };
-
-                            if (data.agentDetails.name === "N/A" && gdpBuilding.contactInfo?.agentFullName) {
-                                data.agentDetails.name = gdpBuilding.contactInfo.agentFullName;
-                            }
-                            if (data.agentDetails.phone === "N/A") {
-                                data.agentDetails.phone = gdpBuilding.contactInfo?.agentPhoneNumber
-                                    || gdpBuilding.buildingPhoneNumber
-                                    || "N/A";
-                            }
-                            // Management company is often only in free-text description
-                            if (data.agentDetails.broker === "N/A" && gdpBuilding.description) {
-                                const mgmtMatch = gdpBuilding.description.match(
-                                    /(?:managed by|Listed by)\s+([A-Z][A-Za-z0-9&.,'\s]+?)(?:[.\n]|$)/i
-                                );
-                                if (mgmtMatch) data.agentDetails.broker = mgmtMatch[1].trim();
-                            }
-                        }
-                    } catch (e) {}
+                    // Extrapolate Agent or FSBO Contact
+                    if (p.attributionInfo) {
+                        data.agentDetails = {
+                            name: p.attributionInfo.agentName || "N/A",
+                            broker: p.attributionInfo.brokerName || "N/A",
+                            phone: p.attributionInfo.agentPhoneNumber || "N/A",
+                            brokerPhone: p.attributionInfo.brokerPhoneNumber || "N/A",
+                            email: p.attributionInfo.agentEmail || "N/A"
+                        };
+                    } else if (p.postingContact) {
+                        data.agentDetails.name = p.postingContact.name || "N/A";
+                        data.agentDetails.phone = p.postingContact.phoneNumber || "N/A";
+                    }
 
                 } catch (e) {
                     // Swallow internal parse errors, return defaults
@@ -315,7 +165,7 @@ async function runScraper() {
 
             const finalUrl = extractedData.canonicalUrl || originalUrl;
 
-            // 5. Rental Layout Memory Map (Columns J through X)
+            // 5. Rental Layout Memory Map (Columns J through W)
             sheet.getCell(rowIndex, 9).value = extractedData.propertyDetails.price;       // Col J: Rent / Price
             sheet.getCell(rowIndex, 10).value = extractedData.propertyDetails.street;     // Col K: Street
             sheet.getCell(rowIndex, 11).value = extractedData.propertyDetails.city;       // Col L: City
@@ -325,20 +175,19 @@ async function runScraper() {
             sheet.getCell(rowIndex, 15).value = extractedData.propertyDetails.baths;      // Col P: Baths
             sheet.getCell(rowIndex, 16).value = extractedData.propertyDetails.type;       // Col Q: Type (Apt, Condo, etc)
             sheet.getCell(rowIndex, 17).value = finalUrl;                                 // Col R: Zillow Link
-            sheet.getCell(rowIndex, 18).value = extractedData.agentDetails.listedByType;  // Col S: Listed By (DOM Fallback)
-            sheet.getCell(rowIndex, 19).value = extractedData.agentDetails.name;          // Col T: Agent/FSBO Name
-            sheet.getCell(rowIndex, 20).value = extractedData.agentDetails.broker;        // Col U: Brokerage
-            sheet.getCell(rowIndex, 21).value = extractedData.agentDetails.phone;         // Col V: Direct Phone
-            sheet.getCell(rowIndex, 22).value = extractedData.agentDetails.email;         // Col W: Direct Email
-            sheet.getCell(rowIndex, 23).value = "✅ SUCCESS";                             // Col X: Status Tracker
+            sheet.getCell(rowIndex, 18).value = extractedData.agentDetails.name;          // Col S: Agent/FSBO Name
+            sheet.getCell(rowIndex, 19).value = extractedData.agentDetails.broker;        // Col T: Brokerage
+            sheet.getCell(rowIndex, 20).value = extractedData.agentDetails.phone;         // Col U: Direct Phone
+            sheet.getCell(rowIndex, 21).value = extractedData.agentDetails.email;         // Col V: Direct Email
+            sheet.getCell(rowIndex, 22).value = "✅ SUCCESS";                             // Col W: Status Tracker
 
             stagedCellsToSave.push(rowIndex);
-            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Agent: ${extractedData.agentDetails.name} | Broker: ${extractedData.agentDetails.broker}`);
+            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Bed/Bath: ${extractedData.propertyDetails.beds}/${extractedData.propertyDetails.baths}`);
             scrapeCount++;
 
         } catch (e) {
             console.error(`   🛑 Error on Row ${actualRowNumber}: ${e.message}`);
-            sheet.getCell(rowIndex, 23).value = "🛑 Error: " + e.message;
+            sheet.getCell(rowIndex, 22).value = "🛑 Error: " + e.message;
             stagedCellsToSave.push(rowIndex);
         } finally {
             if (page) await page.close();
@@ -350,7 +199,7 @@ async function runScraper() {
         if (stagedCellsToSave.length >= FLUSH_BATCH_SIZE) {
             console.log(`📦 Flashing batch of ${stagedCellsToSave.length} records to Google Sheets...`);
             await saveWithRetry(sheet);
-            stagedCellsToSave = [];
+            stagedCellsToSave = []; 
         }
     }
 
