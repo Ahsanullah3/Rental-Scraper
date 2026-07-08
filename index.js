@@ -16,7 +16,7 @@ async function saveWithRetry(sheet, retries = 3) {
     for (let i = 0; i < retries; i++) {
         try {
             await sheet.saveUpdatedCells();
-            return; 
+            return;
         } catch (error) {
             if (i === retries - 1) {
                 console.error("❌ Max retries reached. Google API remains unavailable.");
@@ -33,7 +33,7 @@ async function saveWithRetry(sheet, retries = 3) {
 // 2. CORE SCRAPER ENGINE (Zillow Rentals w/ Direct Fallbacks)
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting Stealth Scraper V13 (Working Engine + Fallbacks)...");
+    console.log("🚀 Starting Stealth Scraper V14 (Agent-Card-Wait Fix)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -61,7 +61,7 @@ async function runScraper() {
 
     let scrapeCount = 0;
     let rowsRemaining = false;
-    const FLUSH_BATCH_SIZE = 10; 
+    const FLUSH_BATCH_SIZE = 10;
     let stagedCellsToSave = [];
 
     // 3. Loop through rows (rowIndex = 1 skips the header)
@@ -70,8 +70,8 @@ async function runScraper() {
         const originalUrl = sheet.getCell(rowIndex, 0).value; // Assuming links are in Column A
         const status = sheet.getCell(rowIndex, 23).value || ""; // Status shifted to Column X (index 23)
 
-        if (!originalUrl) continue; 
-        if (!originalUrl.includes("zillow.com") || status.includes("✅")) continue; 
+        if (!originalUrl) continue;
+        if (!originalUrl.includes("zillow.com") || status.includes("✅")) continue;
 
         if (scrapeCount >= 30) {
             console.log("🛑 Reached 30 rows. Shutting down to rotate runner environment...");
@@ -106,6 +106,27 @@ async function runScraper() {
                 continue;
             }
 
+            // ---------------------------------------------------------
+            // 3a. WAIT FOR THE LISTING-AGENT CARD TO HYDRATE
+            // The agent card (.ds-listing-agent-*) is often rendered
+            // client-side AFTER domcontentloaded fires. Without this
+            // wait, page.evaluate() runs too early and the agent
+            // name/broker come back blank even though they exist.
+            // Bounded timeout so FSBO / no-agent listings don't hang.
+            // ---------------------------------------------------------
+            try {
+                await page.waitForSelector(
+                    '[data-testid="listing-agent-container"], .ds-listing-agent-display-name, .ds-listing-agent-business-name',
+                    { timeout: 8000 }
+                );
+            } catch (waitErr) {
+                console.log(`   ⏳ No agent card detected within timeout on Row ${actualRowNumber} (may be FSBO or slow render).`);
+            }
+
+            // Small extra settle time in case the name/broker spans
+            // populate a beat after the container itself appears.
+            await delay(400);
+
             // 4. Extract Rental parameters from Next.js payload, DOM, and Redux Fallback
             const extractedData = await page.evaluate(() => {
                 let data = {
@@ -114,17 +135,31 @@ async function runScraper() {
                     agentDetails: { listedByType: "N/A", name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A" }
                 };
 
-                // --- FALLBACK 1: DIRECT DOM EXTRACTION ---
+                // --- FALLBACK 1: DIRECT DOM EXTRACTION (now hydration-safe) ---
                 try {
                     const headerEl = document.querySelector('[data-testid="listing-agent-header"]');
-                    if (headerEl) data.agentDetails.listedByType = headerEl.innerText.trim();
+                    if (headerEl && headerEl.innerText.trim() !== "") {
+                        data.agentDetails.listedByType = headerEl.innerText.trim();
+                    }
 
                     const domNameEl = document.querySelector('.ds-listing-agent-display-name');
-                    if (domNameEl) data.agentDetails.name = domNameEl.innerText.trim();
+                    if (domNameEl && domNameEl.innerText.trim() !== "") {
+                        data.agentDetails.name = domNameEl.innerText.trim();
+                    }
 
                     const domBrokerEl = document.querySelector('.ds-listing-agent-business-name');
-                    if (domBrokerEl && domBrokerEl.innerText.trim() !== "") data.agentDetails.broker = domBrokerEl.innerText.trim();
-                } catch(e) {}
+                    if (domBrokerEl && domBrokerEl.innerText.trim() !== "") {
+                        data.agentDetails.broker = domBrokerEl.innerText.trim();
+                    }
+
+                    // Some listings render a phone number as a further
+                    // <li> or <a href="tel:..."> inside the agent info list.
+                    const telAnchor = document.querySelector('[data-testid="listing-agent-container"] a[href^="tel:"]');
+                    if (telAnchor) {
+                        const rawTel = telAnchor.getAttribute('href').replace('tel:', '').trim();
+                        if (rawTel) data.agentDetails.phone = rawTel;
+                    }
+                } catch (e) {}
 
                 const nextDataScript = document.querySelector('script#__NEXT_DATA__');
                 if (!nextDataScript) return data;
@@ -132,18 +167,16 @@ async function runScraper() {
                 try {
                     const jsonData = JSON.parse(nextDataScript.innerText);
 
-                    // --- ROUTE 1: YOUR WORKING RENTALS EXTRACTION ---
+                    // --- ROUTE 1: SINGLE-LISTING RENTALS EXTRACTION ---
                     try {
                         const rawCache = jsonData?.props?.pageProps?.componentProps?.gdpClientCache;
                         if (rawCache) {
                             const parsedCache = JSON.parse(rawCache);
-                            
-                            // Locate the rental specific query key
+
                             const cacheKey = Object.keys(parsedCache).find(key => parsedCache[key]?.property);
                             const p = parsedCache[cacheKey]?.property;
-                            
+
                             if (p) {
-                                // Extrapolate Property Details
                                 data.propertyDetails = {
                                     price: p.price || p.baseRent || "N/A",
                                     street: p.address?.streetAddress || p.streetAddress || "N/A",
@@ -155,34 +188,52 @@ async function runScraper() {
                                     type: p.homeType || "N/A"
                                 };
 
-                                // Extrapolate Agent or FSBO Contact
+                                // Only overwrite DOM-derived agent info if JSON has it
+                                // and the DOM pass didn't already find something.
                                 if (p.attributionInfo) {
-                                    if(p.attributionInfo.agentName) data.agentDetails.name = p.attributionInfo.agentName;
-                                    if(p.attributionInfo.brokerName) data.agentDetails.broker = p.attributionInfo.brokerName;
-                                    data.agentDetails.phone = p.attributionInfo.agentPhoneNumber || "N/A";
+                                    if (data.agentDetails.name === "N/A" && p.attributionInfo.agentName) {
+                                        data.agentDetails.name = p.attributionInfo.agentName;
+                                    }
+                                    if (data.agentDetails.broker === "N/A" && p.attributionInfo.brokerName) {
+                                        data.agentDetails.broker = p.attributionInfo.brokerName;
+                                    }
+                                    if (data.agentDetails.phone === "N/A") {
+                                        data.agentDetails.phone = p.attributionInfo.agentPhoneNumber || "N/A";
+                                    }
                                     data.agentDetails.brokerPhone = p.attributionInfo.brokerPhoneNumber || "N/A";
                                     data.agentDetails.email = p.attributionInfo.agentEmail || "N/A";
                                 } else if (p.postingContact) {
-                                    if(p.postingContact.name) data.agentDetails.name = p.postingContact.name;
-                                    data.agentDetails.phone = p.postingContact.phoneNumber || "N/A";
+                                    if (data.agentDetails.name === "N/A" && p.postingContact.name) {
+                                        data.agentDetails.name = p.postingContact.name;
+                                    }
+                                    if (data.agentDetails.phone === "N/A") {
+                                        data.agentDetails.phone = p.postingContact.phoneNumber || "N/A";
+                                    }
                                 }
                             }
                         }
-                    } catch(e) {}
+                    } catch (e) {}
 
-                    // --- FALLBACK 2: BUILDING / ALTERNATIVE REDUX JSON ---
+                    // --- FALLBACK 2: BUILDING / APARTMENT-COMMUNITY PAGES ---
                     // Only applies if Route 1 failed to grab a price
                     try {
                         const gdpBuilding = jsonData?.props?.pageProps?.initialReduxState?.gdp?.building;
                         if (gdpBuilding && data.propertyDetails.price === "N/A") {
-                            const firstUnit = gdpBuilding.ungroupedUnits?.[0] || {};
-                            
+                            let firstUnit = null;
+                            if (Array.isArray(gdpBuilding.ungroupedUnits) && gdpBuilding.ungroupedUnits.length) {
+                                firstUnit = gdpBuilding.ungroupedUnits[0];
+                            } else if (Array.isArray(gdpBuilding.floorPlans) && gdpBuilding.floorPlans.length) {
+                                const fp = gdpBuilding.floorPlans[0];
+                                firstUnit = (fp.units && fp.units[0]) || fp;
+                            }
+                            firstUnit = firstUnit || {};
+
                             data.propertyDetails = {
-                                price: firstUnit.price || firstUnit.baseRent || "N/A",
-                                street: gdpBuilding.address?.streetAddress || "N/A",
-                                city: gdpBuilding.address?.city || "N/A",
-                                state: gdpBuilding.address?.state || "N/A",
-                                zipcode: gdpBuilding.address?.zipcode || "N/A",
+                                price: firstUnit.price ?? firstUnit.baseRent ?? "N/A",
+                                street: gdpBuilding.address?.streetAddress || gdpBuilding.streetAddress || "N/A",
+                                city: gdpBuilding.address?.city || gdpBuilding.city || "N/A",
+                                state: gdpBuilding.address?.state || gdpBuilding.state || "N/A",
+                                zipcode: gdpBuilding.address?.zipcode || gdpBuilding.zipcode || "N/A",
                                 beds: firstUnit.beds ?? "N/A",
                                 baths: firstUnit.baths ?? "N/A",
                                 type: gdpBuilding.buildingType || "Building"
@@ -191,11 +242,20 @@ async function runScraper() {
                             if (data.agentDetails.name === "N/A" && gdpBuilding.contactInfo?.agentFullName) {
                                 data.agentDetails.name = gdpBuilding.contactInfo.agentFullName;
                             }
-                            if (data.agentDetails.phone === "N/A" && gdpBuilding.contactInfo?.agentPhoneNumber) {
-                                data.agentDetails.phone = gdpBuilding.contactInfo.agentPhoneNumber;
+                            if (data.agentDetails.phone === "N/A") {
+                                data.agentDetails.phone = gdpBuilding.contactInfo?.agentPhoneNumber
+                                    || gdpBuilding.buildingPhoneNumber
+                                    || "N/A";
+                            }
+                            // Management company is often only in free-text description
+                            if (data.agentDetails.broker === "N/A" && gdpBuilding.description) {
+                                const mgmtMatch = gdpBuilding.description.match(
+                                    /(?:managed by|Listed by)\s+([A-Z][A-Za-z0-9&.,'\s]+?)(?:[.\n]|$)/i
+                                );
+                                if (mgmtMatch) data.agentDetails.broker = mgmtMatch[1].trim();
                             }
                         }
-                    } catch(e) {}
+                    } catch (e) {}
 
                 } catch (e) {
                     // Swallow internal parse errors, return defaults
@@ -224,7 +284,7 @@ async function runScraper() {
             sheet.getCell(rowIndex, 23).value = "✅ SUCCESS";                             // Col X: Status Tracker
 
             stagedCellsToSave.push(rowIndex);
-            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Agent: ${extractedData.agentDetails.name}`);
+            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Agent: ${extractedData.agentDetails.name} | Broker: ${extractedData.agentDetails.broker}`);
             scrapeCount++;
 
         } catch (e) {
@@ -241,7 +301,7 @@ async function runScraper() {
         if (stagedCellsToSave.length >= FLUSH_BATCH_SIZE) {
             console.log(`📦 Flashing batch of ${stagedCellsToSave.length} records to Google Sheets...`);
             await saveWithRetry(sheet);
-            stagedCellsToSave = []; 
+            stagedCellsToSave = [];
         }
     }
 
