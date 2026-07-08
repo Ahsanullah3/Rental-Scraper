@@ -4,14 +4,14 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 
-// Enable stealth plugin
+// Enable stealth plugin to prevent detection
 puppeteer.use(StealthPlugin());
-
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // =========================================================
 // 1. EXPONENTIAL BACKOFF (Google API 500 Error Fix)
 // =========================================================
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function saveWithRetry(sheet, retries = 3) {
     for (let i = 0; i < retries; i++) {
         try {
@@ -19,20 +19,21 @@ async function saveWithRetry(sheet, retries = 3) {
             return; 
         } catch (error) {
             if (i === retries - 1) {
-                console.error("❌ Max retries reached. Google API unavailable.");
+                console.error("❌ Max retries reached. Google API remains unavailable.");
                 throw error;
             }
-            console.log(`⚠️ Google API Retry in ${2 ** i} seconds...`);
-            await delay((2 ** i) * 1000);
+            const waitTime = (2 ** i) * 1000;
+            console.log(`⚠️ Google API 500/Timeout. Retrying in ${2 ** i} seconds...`);
+            await delay(waitTime);
         }
     }
 }
 
 // =========================================================
-// 2. CORE SCRAPER ENGINE (V15: Hardened Dual-Payload)
+// 2. CORE SCRAPER ENGINE (Zillow Rentals Edition + Fallbacks)
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting Stealth Scraper V15 (Hardened Building & Rentals Engine)...");
+    console.log("🚀 Starting Stealth Scraper V13 (Zillow Rentals w/ Fallbacks)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -45,8 +46,9 @@ async function runScraper() {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
-    // Expanded to 24 columns to accommodate the new "Listed By Type" field
+    // Expanded to 24 columns to accommodate the "Listed By" DOM fallback
     if (sheet.columnCount < 24) {
+        console.log(`📏 Expanding sheet columns from ${sheet.columnCount} to 24...`);
         await sheet.resize({ rowCount: sheet.rowCount, columnCount: 24 });
     }
 
@@ -62,15 +64,17 @@ async function runScraper() {
     const FLUSH_BATCH_SIZE = 10; 
     let stagedCellsToSave = [];
 
-    // 3. ROW EXECUTION LOOP
+    // 3. Loop through rows (rowIndex = 1 skips the header)
     for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
-        const originalUrl = sheet.getCell(rowIndex, 0).value; 
-        const status = sheet.getCell(rowIndex, 23).value || ""; // Status shifted to Col X (Index 23)
 
-        if (!originalUrl || !originalUrl.includes("zillow.com") || status.includes("✅")) continue; 
+        const originalUrl = sheet.getCell(rowIndex, 0).value; 
+        const status = sheet.getCell(rowIndex, 23).value || ""; // Status shifted to Column X (index 23)
+
+        if (!originalUrl) continue; 
+        if (!originalUrl.includes("zillow.com") || status.includes("✅")) continue; 
 
         if (scrapeCount >= 30) {
-            console.log("🛑 Reached 30 rows. Rotating runner environment...");
+            console.log("🛑 Reached 30 rows. Shutting down to rotate runner environment...");
             rowsRemaining = true;
             break;
         }
@@ -82,7 +86,7 @@ async function runScraper() {
 
         try {
             await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-            
+
             await page.setRequestInterception(true);
             page.on('request', (req) => {
                 if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
@@ -92,23 +96,27 @@ async function runScraper() {
                 }
             });
 
+            await delay(Math.floor(Math.random() * 500) + 500);
             await page.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
             const pageTitle = await page.title();
             if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
-                throw new Error("BLOCKED (IP Burned)");
+                console.log(`❌ BLOCKED: IP has been flagged on Row ${actualRowNumber}`);
+                sheet.getCell(rowIndex, 23).value = "❌ BLOCKED (IP Burned)";
+                await saveWithRetry(sheet);
+                await page.close();
+                continue;
             }
 
-            // 4. DUAL-PAYLOAD EXTRACTION ENGINE (Hardened & Decoupled)
+            // 4. Extract Rental parameters with DOM & Building Redux Fallbacks
             const extractedData = await page.evaluate(() => {
                 let data = {
                     canonicalUrl: document.querySelector('meta[property="og:url"]')?.content || "",
                     propertyDetails: { price: "N/A", street: "N/A", city: "N/A", state: "N/A", zipcode: "N/A", beds: "N/A", baths: "N/A", type: "N/A" },
-                    agentDetails: { listedByType: "N/A", name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A" },
-                    debugLog: "Clean"
+                    agentDetails: { listedByType: "N/A", name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A" }
                 };
 
-                // --- A. DIRECT DOM EXTRACTION ---
+                // --- FALLBACK 1: DIRECT DOM EXTRACTION ---
                 try {
                     const headerEl = document.querySelector('[data-testid="listing-agent-header"]');
                     if (headerEl) data.agentDetails.listedByType = headerEl.innerText.trim();
@@ -118,24 +126,17 @@ async function runScraper() {
 
                     const domBrokerEl = document.querySelector('.ds-listing-agent-business-name');
                     if (domBrokerEl && domBrokerEl.innerText.trim() !== "") data.agentDetails.broker = domBrokerEl.innerText.trim();
-                } catch(e) { data.debugLog = "DOM Error; "; }
+                } catch(e) {}
 
-                // --- B. NEXT.JS HYDRATION PARSING ---
                 const nextDataScript = document.querySelector('script#__NEXT_DATA__');
-                if (!nextDataScript) {
-                    data.debugLog += "No __NEXT_DATA__ found.";
-                    return data;
-                }
+                if (!nextDataScript) return data;
 
                 let jsonData;
                 try {
                     jsonData = JSON.parse(nextDataScript.innerText);
-                } catch(e) {
-                    data.debugLog += "Fatal: Failed to parse main __NEXT_DATA__ script.";
-                    return data;
-                }
+                } catch (e) { return data; }
 
-                // Route 1: Standard Rentals Cache (Isolated Try/Catch)
+                // --- PRIMARY EXTRACTION: STANDARD RENTALS CACHE ---
                 try {
                     const rawCache = jsonData?.props?.pageProps?.componentProps?.gdpClientCache;
                     if (rawCache) {
@@ -158,20 +159,21 @@ async function runScraper() {
                             if (data.agentDetails.name === "N/A") {
                                 data.agentDetails.name = p.attributionInfo?.agentName || p.postingContact?.name || "N/A";
                             }
-                            data.agentDetails.phone = p.attributionInfo?.agentPhoneNumber || p.postingContact?.phoneNumber || "N/A";
+                            if (data.agentDetails.phone === "N/A") {
+                                data.agentDetails.phone = p.attributionInfo?.agentPhoneNumber || p.postingContact?.phoneNumber || "N/A";
+                            }
                             data.agentDetails.email = p.attributionInfo?.agentEmail || "N/A";
-                            if (data.agentDetails.broker === "N/A") data.agentDetails.broker = p.attributionInfo?.brokerName || "N/A";
+                            if (data.agentDetails.broker === "N/A") {
+                                data.agentDetails.broker = p.attributionInfo?.brokerName || "N/A";
+                            }
                         }
                     }
-                } catch (e) {
-                    data.debugLog += `Route 1 Error: ${e.message}; `;
-                }
+                } catch (e) {}
 
-                // Route 2: Building Page Sub-App Payload (Isolated Try/Catch)
+                // --- FALLBACK 2: BUILDING / ALTERNATIVE REDUX PAYLOAD ---
                 try {
                     const gdpBuilding = jsonData?.props?.pageProps?.initialReduxState?.gdp?.building;
                     if (gdpBuilding && data.propertyDetails.price === "N/A") {
-                        
                         const firstUnit = gdpBuilding.ungroupedUnits?.[0] || {};
                         
                         data.propertyDetails = {
@@ -192,41 +194,32 @@ async function runScraper() {
                             data.agentDetails.phone = gdpBuilding.contactInfo?.agentPhoneNumber || "N/A";
                         }
                     }
-                } catch (e) {
-                    data.debugLog += `Route 2 Error: ${e.message}; `;
-                }
+                } catch (e) {}
 
                 return data;
             });
 
-            // Log the debugging tracer
-            if (extractedData.debugLog !== "Clean") {
-                console.log(`   ⚠️ UI Extraction Trace: ${extractedData.debugLog}`);
-            }
-
             const finalUrl = extractedData.canonicalUrl || originalUrl;
 
-            // 5. LAYOUT MEMORY MAP (Columns J through X)
-            sheet.getCell(rowIndex, 9).value = extractedData.propertyDetails.price;       // Col J
-            sheet.getCell(rowIndex, 10).value = extractedData.propertyDetails.street;     // Col K
-            sheet.getCell(rowIndex, 11).value = extractedData.propertyDetails.city;       // Col L
-            sheet.getCell(rowIndex, 12).value = extractedData.propertyDetails.state;      // Col M
-            sheet.getCell(rowIndex, 13).value = extractedData.propertyDetails.zipcode;    // Col N
-            sheet.getCell(rowIndex, 14).value = extractedData.propertyDetails.beds;       // Col O
-            sheet.getCell(rowIndex, 15).value = extractedData.propertyDetails.baths;      // Col P
-            sheet.getCell(rowIndex, 16).value = extractedData.propertyDetails.type;       // Col Q
-            sheet.getCell(rowIndex, 17).value = finalUrl;                                 // Col R
-            
-            // Agent Layout
-            sheet.getCell(rowIndex, 18).value = extractedData.agentDetails.listedByType;  // Col S
-            sheet.getCell(rowIndex, 19).value = extractedData.agentDetails.name;          // Col T 
-            sheet.getCell(rowIndex, 20).value = extractedData.agentDetails.broker;        // Col U
-            sheet.getCell(rowIndex, 21).value = extractedData.agentDetails.phone;         // Col V
-            sheet.getCell(rowIndex, 22).value = extractedData.agentDetails.email;         // Col W
+            // 5. Rental Layout Memory Map (Columns J through X)
+            sheet.getCell(rowIndex, 9).value = extractedData.propertyDetails.price;       // Col J: Rent / Price
+            sheet.getCell(rowIndex, 10).value = extractedData.propertyDetails.street;     // Col K: Street
+            sheet.getCell(rowIndex, 11).value = extractedData.propertyDetails.city;       // Col L: City
+            sheet.getCell(rowIndex, 12).value = extractedData.propertyDetails.state;      // Col M: State
+            sheet.getCell(rowIndex, 13).value = extractedData.propertyDetails.zipcode;    // Col N: Zipcode
+            sheet.getCell(rowIndex, 14).value = extractedData.propertyDetails.beds;       // Col O: Beds
+            sheet.getCell(rowIndex, 15).value = extractedData.propertyDetails.baths;      // Col P: Baths
+            sheet.getCell(rowIndex, 16).value = extractedData.propertyDetails.type;       // Col Q: Type (Apt, Condo, etc)
+            sheet.getCell(rowIndex, 17).value = finalUrl;                                 // Col R: Zillow Link
+            sheet.getCell(rowIndex, 18).value = extractedData.agentDetails.listedByType;  // Col S: Listed By (DOM Fallback)
+            sheet.getCell(rowIndex, 19).value = extractedData.agentDetails.name;          // Col T: Agent/FSBO Name
+            sheet.getCell(rowIndex, 20).value = extractedData.agentDetails.broker;        // Col U: Brokerage
+            sheet.getCell(rowIndex, 21).value = extractedData.agentDetails.phone;         // Col V: Direct Phone
+            sheet.getCell(rowIndex, 22).value = extractedData.agentDetails.email;         // Col W: Direct Email
             sheet.getCell(rowIndex, 23).value = "✅ SUCCESS";                             // Col X: Status Tracker
 
             stagedCellsToSave.push(rowIndex);
-            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Listed By: ${extractedData.agentDetails.listedByType} (${extractedData.agentDetails.name})`);
+            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Agent: ${extractedData.agentDetails.name}`);
             scrapeCount++;
 
         } catch (e) {
@@ -237,7 +230,9 @@ async function runScraper() {
             if (page) await page.close();
         }
 
+        // =========================================================
         // 6. PERIODIC BATCH WRITING
+        // =========================================================
         if (stagedCellsToSave.length >= FLUSH_BATCH_SIZE) {
             console.log(`📦 Flashing batch of ${stagedCellsToSave.length} records to Google Sheets...`);
             await saveWithRetry(sheet);
@@ -246,7 +241,7 @@ async function runScraper() {
     }
 
     if (stagedCellsToSave.length > 0) {
-        console.log(`📦 Flashing final ${stagedCellsToSave.length} trailing records...`);
+        console.log(`📦 Flashing final ${stagedCellsToSave.length} trailing records to Google Sheets...`);
         await saveWithRetry(sheet);
     }
 
@@ -256,10 +251,10 @@ async function runScraper() {
     if (process.env.GITHUB_OUTPUT) {
         if (rowsRemaining) {
             fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=true\n");
-            console.log("🔄 Trigger token passed to runner pipeline.");
+            console.log("🔄 Remaining links found. Relaying trigger token to runner pipeline...");
         } else {
             fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=false\n");
-            console.log("🎉 Execution completed!");
+            console.log("🎉 Entire sheet processing execution completed!");
         }
     }
 }
