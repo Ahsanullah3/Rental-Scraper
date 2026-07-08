@@ -97,7 +97,20 @@ async function runScraper() {
             await delay(Math.floor(Math.random() * 500) + 500);
             await page.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-            const pageTitle = await page.title();
+            let pageTitle = await page.title();
+
+            // ---------------------------------------------------------
+            // 3a. BLOCK-PAGE CHECK WITH ONE RELOAD ATTEMPT
+            // PerimeterX/bot-detection blocks can be transient — a single
+            // reload sometimes clears it before we give up on the row.
+            // ---------------------------------------------------------
+            if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
+                console.log(`   ⚠️ Possible block detected on Row ${actualRowNumber}. Reloading once before giving up...`);
+                await delay(2000 + Math.floor(Math.random() * 2000));
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+                pageTitle = await page.title();
+            }
+
             if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
                 console.log(`❌ BLOCKED: IP has been flagged on Row ${actualRowNumber}`);
                 sheet.getCell(rowIndex, 23).value = "❌ BLOCKED (IP Burned)";
@@ -107,13 +120,15 @@ async function runScraper() {
             }
 
             // ---------------------------------------------------------
-            // 3a. WAIT FOR THE LISTING-AGENT CARD TO HYDRATE
+            // 3b. WAIT FOR THE LISTING-AGENT CARD TO HYDRATE
             // Zillow server-renders a "Contact manager" PLACEHOLDER first,
             // then swaps in the real agent card (.ds-listing-agent-*) via
             // an async client-side call once it resolves. This swap can
             // take longer than a few seconds, especially from datacenter
-            // IPs (GitHub Actions runners). So: poll with retries instead
-            // of giving up after a single short timeout.
+            // IPs (GitHub Actions runners). Between attempts, RELOAD the
+            // page rather than just waiting longer on the same DOM —
+            // a stuck/failed async call often needs a fresh navigation
+            // to retrigger, and this also helps recover from soft-blocks.
             // ---------------------------------------------------------
             let agentCardFound = false;
             const MAX_AGENT_WAIT_ATTEMPTS = 3;
@@ -128,12 +143,18 @@ async function runScraper() {
                 } catch (waitErr) {
                     console.log(`   ⏳ Agent card not ready yet (attempt ${attempt}/${MAX_AGENT_WAIT_ATTEMPTS}) on Row ${actualRowNumber}.`);
                     if (attempt < MAX_AGENT_WAIT_ATTEMPTS) {
-                        await delay(3000);
+                        console.log(`   🔄 Reloading page before retrying...`);
+                        await delay(1500 + Math.floor(Math.random() * 1500));
+                        try {
+                            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+                        } catch (reloadErr) {
+                            console.log(`   ⚠️ Reload failed on Row ${actualRowNumber}: ${reloadErr.message}`);
+                        }
                     }
                 }
             }
             if (!agentCardFound) {
-                console.log(`   ⚠️ Agent card never appeared after ${MAX_AGENT_WAIT_ATTEMPTS} attempts on Row ${actualRowNumber} — may genuinely be a Contact Manager listing.`);
+                console.log(`   ⚠️ Agent card never appeared after ${MAX_AGENT_WAIT_ATTEMPTS} attempts (with reloads) on Row ${actualRowNumber} — may genuinely be a Contact Manager listing.`);
             }
 
             // Small extra settle time so text content is fully populated.
