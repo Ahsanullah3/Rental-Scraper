@@ -108,24 +108,36 @@ async function runScraper() {
 
             // ---------------------------------------------------------
             // 3a. WAIT FOR THE LISTING-AGENT CARD TO HYDRATE
-            // The agent card (.ds-listing-agent-*) is often rendered
-            // client-side AFTER domcontentloaded fires. Without this
-            // wait, page.evaluate() runs too early and the agent
-            // name/broker come back blank even though they exist.
-            // Bounded timeout so FSBO / no-agent listings don't hang.
+            // Zillow server-renders a "Contact manager" PLACEHOLDER first,
+            // then swaps in the real agent card (.ds-listing-agent-*) via
+            // an async client-side call once it resolves. This swap can
+            // take longer than a few seconds, especially from datacenter
+            // IPs (GitHub Actions runners). So: poll with retries instead
+            // of giving up after a single short timeout.
             // ---------------------------------------------------------
-            try {
-                await page.waitForSelector(
-                    '[data-testid="listing-agent-container"], .ds-listing-agent-display-name, .ds-listing-agent-business-name',
-                    { timeout: 8000 }
-                );
-            } catch (waitErr) {
-                console.log(`   ⏳ No agent card detected within timeout on Row ${actualRowNumber} (may be FSBO or slow render).`);
+            let agentCardFound = false;
+            const MAX_AGENT_WAIT_ATTEMPTS = 3;
+            for (let attempt = 1; attempt <= MAX_AGENT_WAIT_ATTEMPTS; attempt++) {
+                try {
+                    await page.waitForSelector(
+                        '.ds-listing-agent-display-name, .ds-listing-agent-business-name',
+                        { timeout: 12000 }
+                    );
+                    agentCardFound = true;
+                    break;
+                } catch (waitErr) {
+                    console.log(`   ⏳ Agent card not ready yet (attempt ${attempt}/${MAX_AGENT_WAIT_ATTEMPTS}) on Row ${actualRowNumber}.`);
+                    if (attempt < MAX_AGENT_WAIT_ATTEMPTS) {
+                        await delay(3000);
+                    }
+                }
+            }
+            if (!agentCardFound) {
+                console.log(`   ⚠️ Agent card never appeared after ${MAX_AGENT_WAIT_ATTEMPTS} attempts on Row ${actualRowNumber} — may genuinely be a Contact Manager listing.`);
             }
 
-            // Small extra settle time in case the name/broker spans
-            // populate a beat after the container itself appears.
-            await delay(400);
+            // Small extra settle time so text content is fully populated.
+            await delay(500);
 
             // 4. Extract Rental parameters from Next.js payload, DOM, and Redux Fallback
             const extractedData = await page.evaluate(() => {
@@ -134,6 +146,22 @@ async function runScraper() {
                     propertyDetails: { price: "N/A", street: "N/A", city: "N/A", state: "N/A", zipcode: "N/A", beds: "N/A", baths: "N/A", type: "N/A" },
                     agentDetails: { listedByType: "N/A", name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A" }
                 };
+
+                // --- CHECK FOR "CONTACT MANAGER" FLOW (no named agent exists) ---
+                // Some listings (landlord/property-manager self-posted via
+                // Rental Manager) never show a named agent at all — instead
+                // showing "Contact manager for more details about this home."
+                // In that case there is nothing to scrape; label it clearly
+                // instead of leaving a misleading N/A.
+                try {
+                    const bodyText = document.body.innerText || "";
+                    const hasAgentCard = !!document.querySelector('[data-testid="listing-agent-container"], .ds-listing-agent-display-name');
+                    if (!hasAgentCard && /contact manager/i.test(bodyText)) {
+                        data.agentDetails.listedByType = "NO AGENT (Contact Manager Flow)";
+                        data.agentDetails.name = "N/A - Contact Manager";
+                        data.agentDetails.broker = "N/A - Contact Manager";
+                    }
+                } catch (e) {}
 
                 // --- FALLBACK 1: DIRECT DOM EXTRACTION (now hydration-safe) ---
                 try {
