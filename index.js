@@ -30,10 +30,10 @@ async function saveWithRetry(sheet, retries = 3) {
 }
 
 // =========================================================
-// 2. CORE SCRAPER ENGINE (Zillow Rentals Edition + Fallbacks)
+// 2. CORE SCRAPER ENGINE (Zillow Rentals Edition)
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting Stealth Scraper V13 (Zillow Rentals w/ Fallbacks)...");
+    console.log("🚀 Starting Stealth Scraper V13 (Zillow Rentals / FSBO Cache Extraction)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -46,17 +46,17 @@ async function runScraper() {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
-    // Expanded to 24 columns to accommodate the "Listed By" DOM fallback
-    if (sheet.columnCount < 24) {
-        console.log(`📏 Expanding sheet columns from ${sheet.columnCount} to 24...`);
-        await sheet.resize({ rowCount: sheet.rowCount, columnCount: 24 });
+    // Ensure we have enough columns for the expanded rental layout (up to Column W / index 22)
+    if (sheet.columnCount < 23) {
+        console.log(`📏 Expanding sheet columns from ${sheet.columnCount} to 23...`);
+        await sheet.resize({ rowCount: sheet.rowCount, columnCount: 23 });
     }
 
     await sheet.loadCells();
 
     const browser = await puppeteer.launch({
         headless: "new",
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
 
     let scrapeCount = 0;
@@ -67,8 +67,8 @@ async function runScraper() {
     // 3. Loop through rows (rowIndex = 1 skips the header)
     for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
 
-        const originalUrl = sheet.getCell(rowIndex, 0).value; 
-        const status = sheet.getCell(rowIndex, 23).value || ""; // Status shifted to Column X (index 23)
+        const originalUrl = sheet.getCell(rowIndex, 0).value; // Assuming links are in Column A
+        const status = sheet.getCell(rowIndex, 22).value || ""; // Status shifted to Column W (index 22)
 
         if (!originalUrl) continue; 
         if (!originalUrl.includes("zillow.com") || status.includes("✅")) continue; 
@@ -85,8 +85,6 @@ async function runScraper() {
         const page = await browser.newPage();
 
         try {
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
             await page.setRequestInterception(true);
             page.on('request', (req) => {
                 if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
@@ -102,106 +100,72 @@ async function runScraper() {
             const pageTitle = await page.title();
             if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
                 console.log(`❌ BLOCKED: IP has been flagged on Row ${actualRowNumber}`);
-                sheet.getCell(rowIndex, 23).value = "❌ BLOCKED (IP Burned)";
+                sheet.getCell(rowIndex, 22).value = "❌ BLOCKED (IP Burned)";
                 await saveWithRetry(sheet);
                 await page.close();
                 continue;
             }
 
-            // 4. Extract Rental parameters with DOM & Building Redux Fallbacks
+            // 4. Extract Rental parameters from Next.js payload & Canonical Tag
             const extractedData = await page.evaluate(() => {
                 let data = {
                     canonicalUrl: document.querySelector('meta[property="og:url"]')?.content || "",
                     propertyDetails: { price: "N/A", street: "N/A", city: "N/A", state: "N/A", zipcode: "N/A", beds: "N/A", baths: "N/A", type: "N/A" },
-                    agentDetails: { listedByType: "N/A", name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A" }
+                    agentDetails: { name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A" }
                 };
-
-                // --- FALLBACK 1: DIRECT DOM EXTRACTION ---
-                try {
-                    const headerEl = document.querySelector('[data-testid="listing-agent-header"]');
-                    if (headerEl) data.agentDetails.listedByType = headerEl.innerText.trim();
-
-                    const domNameEl = document.querySelector('.ds-listing-agent-display-name');
-                    if (domNameEl) data.agentDetails.name = domNameEl.innerText.trim();
-
-                    const domBrokerEl = document.querySelector('.ds-listing-agent-business-name');
-                    if (domBrokerEl && domBrokerEl.innerText.trim() !== "") data.agentDetails.broker = domBrokerEl.innerText.trim();
-                } catch(e) {}
 
                 const nextDataScript = document.querySelector('script#__NEXT_DATA__');
                 if (!nextDataScript) return data;
 
-                let jsonData;
                 try {
-                    jsonData = JSON.parse(nextDataScript.innerText);
-                } catch (e) { return data; }
-
-                // --- PRIMARY EXTRACTION: STANDARD RENTALS CACHE ---
-                try {
+                    const jsonData = JSON.parse(nextDataScript.innerText);
                     const rawCache = jsonData?.props?.pageProps?.componentProps?.gdpClientCache;
-                    if (rawCache) {
-                        const parsedCache = typeof rawCache === 'string' ? JSON.parse(rawCache) : rawCache;
-                        const cacheKey = Object.keys(parsedCache).find(key => parsedCache[key]?.property);
-                        const p = parsedCache[cacheKey]?.property;
-                        
-                        if (p) {
-                            data.propertyDetails = {
-                                price: p.price || p.baseRent || "N/A",
-                                street: p.address?.streetAddress || p.streetAddress || "N/A",
-                                city: p.address?.city || p.city || "N/A",
-                                state: p.address?.state || p.state || "N/A",
-                                zipcode: p.address?.zipcode || p.zipcode || "N/A",
-                                beds: p.bedrooms ?? "N/A",
-                                baths: p.bathrooms ?? "N/A",
-                                type: p.homeType || "N/A"
-                            };
+                    if (!rawCache) return data;
 
-                            if (data.agentDetails.name === "N/A") {
-                                data.agentDetails.name = p.attributionInfo?.agentName || p.postingContact?.name || "N/A";
-                            }
-                            if (data.agentDetails.phone === "N/A") {
-                                data.agentDetails.phone = p.attributionInfo?.agentPhoneNumber || p.postingContact?.phoneNumber || "N/A";
-                            }
-                            data.agentDetails.email = p.attributionInfo?.agentEmail || "N/A";
-                            if (data.agentDetails.broker === "N/A") {
-                                data.agentDetails.broker = p.attributionInfo?.brokerName || "N/A";
-                            }
-                        }
-                    }
-                } catch (e) {}
+                    const parsedCache = JSON.parse(rawCache);
+                    
+                    // Locate the rental specific query key
+                    const cacheKey = Object.keys(parsedCache).find(key => parsedCache[key]?.property);
+                    const p = parsedCache[cacheKey]?.property;
+                    
+                    if (!p) return data;
 
-                // --- FALLBACK 2: BUILDING / ALTERNATIVE REDUX PAYLOAD ---
-                try {
-                    const gdpBuilding = jsonData?.props?.pageProps?.initialReduxState?.gdp?.building;
-                    if (gdpBuilding && data.propertyDetails.price === "N/A") {
-                        const firstUnit = gdpBuilding.ungroupedUnits?.[0] || {};
-                        
-                        data.propertyDetails = {
-                            price: firstUnit.price || firstUnit.baseRent || "N/A",
-                            street: gdpBuilding.address?.streetAddress || "N/A",
-                            city: gdpBuilding.address?.city || "N/A",
-                            state: gdpBuilding.address?.state || "N/A",
-                            zipcode: gdpBuilding.address?.zipcode || "N/A",
-                            beds: firstUnit.beds ?? "N/A",
-                            baths: firstUnit.baths ?? "N/A",
-                            type: gdpBuilding.buildingType || "Building"
+                    // Extrapolate Property Details
+                    data.propertyDetails = {
+                        price: p.price || p.baseRent || "N/A",
+                        street: p.address?.streetAddress || p.streetAddress || "N/A",
+                        city: p.address?.city || p.city || "N/A",
+                        state: p.address?.state || p.state || "N/A",
+                        zipcode: p.address?.zipcode || p.zipcode || "N/A",
+                        beds: p.bedrooms ?? "N/A",
+                        baths: p.bathrooms ?? "N/A",
+                        type: p.homeType || "N/A"
+                    };
+
+                    // Extrapolate Agent or FSBO Contact
+                    if (p.attributionInfo) {
+                        data.agentDetails = {
+                            name: p.attributionInfo.agentName || "N/A",
+                            broker: p.attributionInfo.brokerName || "N/A",
+                            phone: p.attributionInfo.agentPhoneNumber || "N/A",
+                            brokerPhone: p.attributionInfo.brokerPhoneNumber || "N/A",
+                            email: p.attributionInfo.agentEmail || "N/A"
                         };
-
-                        if (data.agentDetails.name === "N/A") {
-                            data.agentDetails.name = gdpBuilding.contactInfo?.agentFullName || "N/A";
-                        }
-                        if (data.agentDetails.phone === "N/A") {
-                            data.agentDetails.phone = gdpBuilding.contactInfo?.agentPhoneNumber || "N/A";
-                        }
+                    } else if (p.postingContact) {
+                        data.agentDetails.name = p.postingContact.name || "N/A";
+                        data.agentDetails.phone = p.postingContact.phoneNumber || "N/A";
                     }
-                } catch (e) {}
+
+                } catch (e) {
+                    // Swallow internal parse errors, return defaults
+                }
 
                 return data;
             });
 
             const finalUrl = extractedData.canonicalUrl || originalUrl;
 
-            // 5. Rental Layout Memory Map (Columns J through X)
+            // 5. Rental Layout Memory Map (Columns J through W)
             sheet.getCell(rowIndex, 9).value = extractedData.propertyDetails.price;       // Col J: Rent / Price
             sheet.getCell(rowIndex, 10).value = extractedData.propertyDetails.street;     // Col K: Street
             sheet.getCell(rowIndex, 11).value = extractedData.propertyDetails.city;       // Col L: City
@@ -211,20 +175,19 @@ async function runScraper() {
             sheet.getCell(rowIndex, 15).value = extractedData.propertyDetails.baths;      // Col P: Baths
             sheet.getCell(rowIndex, 16).value = extractedData.propertyDetails.type;       // Col Q: Type (Apt, Condo, etc)
             sheet.getCell(rowIndex, 17).value = finalUrl;                                 // Col R: Zillow Link
-            sheet.getCell(rowIndex, 18).value = extractedData.agentDetails.listedByType;  // Col S: Listed By (DOM Fallback)
-            sheet.getCell(rowIndex, 19).value = extractedData.agentDetails.name;          // Col T: Agent/FSBO Name
-            sheet.getCell(rowIndex, 20).value = extractedData.agentDetails.broker;        // Col U: Brokerage
-            sheet.getCell(rowIndex, 21).value = extractedData.agentDetails.phone;         // Col V: Direct Phone
-            sheet.getCell(rowIndex, 22).value = extractedData.agentDetails.email;         // Col W: Direct Email
-            sheet.getCell(rowIndex, 23).value = "✅ SUCCESS";                             // Col X: Status Tracker
+            sheet.getCell(rowIndex, 18).value = extractedData.agentDetails.name;          // Col S: Agent/FSBO Name
+            sheet.getCell(rowIndex, 19).value = extractedData.agentDetails.broker;        // Col T: Brokerage
+            sheet.getCell(rowIndex, 20).value = extractedData.agentDetails.phone;         // Col U: Direct Phone
+            sheet.getCell(rowIndex, 21).value = extractedData.agentDetails.email;         // Col V: Direct Email
+            sheet.getCell(rowIndex, 22).value = "✅ SUCCESS";                             // Col W: Status Tracker
 
             stagedCellsToSave.push(rowIndex);
-            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Agent: ${extractedData.agentDetails.name}`);
+            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Bed/Bath: ${extractedData.propertyDetails.beds}/${extractedData.propertyDetails.baths}`);
             scrapeCount++;
 
         } catch (e) {
             console.error(`   🛑 Error on Row ${actualRowNumber}: ${e.message}`);
-            sheet.getCell(rowIndex, 23).value = "🛑 Error: " + e.message;
+            sheet.getCell(rowIndex, 22).value = "🛑 Error: " + e.message;
             stagedCellsToSave.push(rowIndex);
         } finally {
             if (page) await page.close();
