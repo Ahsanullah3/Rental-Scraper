@@ -1,0 +1,37 @@
+name: Zillow Diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_url:
+        description: 'Zillow URL to diagnose'
+        required: true
+        type: string
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run diagnostic
+        run: node zillow_diagnostic.js "${{ inputs.test_url }}"
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zillow-debug-output
+          path: |
+            /tmp/zillow_debug_page.html
+            /tmp/zillow_debug_screenshot.png
+          if-no-files-found: warn
