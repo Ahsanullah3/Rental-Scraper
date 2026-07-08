@@ -33,7 +33,7 @@ async function saveWithRetry(sheet, retries = 3) {
 // 2. CORE SCRAPER ENGINE (Zillow Rentals Edition)
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting Stealth Scraper V14 (Zillow Rentals with Dynamic Listed By)...");
+    console.log("🚀 Starting Stealth Scraper V15 (Optimized Loading)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -56,7 +56,13 @@ async function runScraper() {
 
     const browser = await puppeteer.launch({
         headless: "new",
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--disable-gpu'
+        ]
     });
 
     let scrapeCount = 0;
@@ -83,6 +89,10 @@ async function runScraper() {
         console.log(`\n🕵️ Scraping Row ${actualRowNumber}: ${originalUrl}`);
 
         const page = await browser.newPage();
+        
+        // Set a more generous timeout
+        page.setDefaultNavigationTimeout(45000);
+        page.setDefaultTimeout(45000);
 
         try {
             await page.setRequestInterception(true);
@@ -95,7 +105,9 @@ async function runScraper() {
             });
 
             await delay(Math.floor(Math.random() * 500) + 500);
-            await page.goto(originalUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            
+            // Use domcontentloaded for faster initial load
+            await page.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
             const pageTitle = await page.title();
             if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
@@ -106,22 +118,66 @@ async function runScraper() {
                 continue;
             }
 
-            // Wait for the "Listed by" element to appear (with timeout)
+            // Wait for the main property data to be available
+            try {
+                await page.waitForFunction(() => {
+                    const nextData = document.querySelector('script#__NEXT_DATA__');
+                    return nextData && nextData.innerText.includes('gdpClientCache');
+                }, { timeout: 15000 });
+                console.log(`   ✅ Property data loaded`);
+            } catch (e) {
+                console.log(`   ⚠️ Property data not found, proceeding anyway...`);
+            }
+
+            // Now try to wait for "Listed by" element with a shorter timeout
             let listedByText = "N/A";
             try {
                 await page.waitForSelector('[data-testid="listing-agent-header"]', { timeout: 8000 });
                 listedByText = await page.$eval('[data-testid="listing-agent-header"]', el => el.textContent.trim());
                 console.log(`   📋 Listed by found: ${listedByText}`);
             } catch (waitError) {
-                console.log(`   ⚠️ Listed by element not found within timeout - trying fallback selectors...`);
-                // Fallback: try alternative selectors
-                try {
-                    listedByText = await page.$eval('.ds-listing-agent-header', el => el.textContent.trim());
-                    console.log(`   📋 Listed by found via fallback: ${listedByText}`);
-                } catch (fallbackError) {
-                    console.log(`   ⚠️ Listed by element not found at all`);
+                console.log(`   ⚠️ Listed by element not found - trying alternative methods...`);
+                
+                // Try multiple fallback selectors
+                const fallbackSelectors = [
+                    '.ds-listing-agent-header',
+                    '[class*="listing-agent-header"]',
+                    'div:contains("Listed by")',
+                    'h3:contains("Listed by")'
+                ];
+                
+                for (const selector of fallbackSelectors) {
+                    try {
+                        const element = await page.$(selector);
+                        if (element) {
+                            listedByText = await page.evaluate(el => el.textContent.trim(), element);
+                            console.log(`   📋 Listed by found via fallback (${selector}): ${listedByText}`);
+                            break;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+                
+                if (listedByText === "N/A") {
+                    // Last resort: search all text content for "Listed by"
+                    try {
+                        listedByText = await page.evaluate(() => {
+                            const bodyText = document.body.innerText;
+                            const match = bodyText.match(/Listed by[^\n]*/);
+                            return match ? match[0].trim() : "N/A";
+                        });
+                        if (listedByText !== "N/A") {
+                            console.log(`   📋 Listed by found via text search: ${listedByText}`);
+                        }
+                    } catch (e) {
+                        console.log(`   ⚠️ All attempts to find "Listed by" failed`);
+                    }
                 }
             }
+
+            // Additional wait to ensure everything is loaded
+            await delay(2000);
 
             // 4. Extract Rental parameters from Next.js payload & Canonical Tag
             const extractedData = await page.evaluate((listedByText) => {
@@ -201,7 +257,7 @@ async function runScraper() {
             sheet.getCell(rowIndex, 23).value = "✅ SUCCESS";                             // Col X: Status Tracker
 
             stagedCellsToSave.push(rowIndex);
-            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Bed/Bath: ${extractedData.propertyDetails.beds}/${extractedData.propertyDetails.baths}`);
+            console.log(`   ✔️ Staged Row ${actualRowNumber} | Rent: ${extractedData.propertyDetails.price} | Bed/Bath: ${extractedData.propertyDetails.beds}/${extractedData.propertyDetails.baths} | Listed: ${extractedData.agentDetails.listedBy}`);
             scrapeCount++;
 
         } catch (e) {
