@@ -33,7 +33,7 @@ async function saveWithRetry(sheet, retries = 3) {
 // 2. CORE SCRAPER ENGINE (Zillow Rentals Edition)
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting Stealth Scraper V13 (Zillow Rentals / FSBO Cache Extraction)...");
+    console.log("🚀 Starting Stealth Scraper V14 (Zillow Rentals with Dynamic Listed By)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -95,7 +95,7 @@ async function runScraper() {
             });
 
             await delay(Math.floor(Math.random() * 500) + 500);
-            await page.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(originalUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
             const pageTitle = await page.title();
             if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
@@ -106,19 +106,30 @@ async function runScraper() {
                 continue;
             }
 
+            // Wait for the "Listed by" element to appear (with timeout)
+            let listedByText = "N/A";
+            try {
+                await page.waitForSelector('[data-testid="listing-agent-header"]', { timeout: 8000 });
+                listedByText = await page.$eval('[data-testid="listing-agent-header"]', el => el.textContent.trim());
+                console.log(`   📋 Listed by found: ${listedByText}`);
+            } catch (waitError) {
+                console.log(`   ⚠️ Listed by element not found within timeout - trying fallback selectors...`);
+                // Fallback: try alternative selectors
+                try {
+                    listedByText = await page.$eval('.ds-listing-agent-header', el => el.textContent.trim());
+                    console.log(`   📋 Listed by found via fallback: ${listedByText}`);
+                } catch (fallbackError) {
+                    console.log(`   ⚠️ Listed by element not found at all`);
+                }
+            }
+
             // 4. Extract Rental parameters from Next.js payload & Canonical Tag
-            const extractedData = await page.evaluate(() => {
+            const extractedData = await page.evaluate((listedByText) => {
                 let data = {
                     canonicalUrl: document.querySelector('meta[property="og:url"]')?.content || "",
                     propertyDetails: { price: "N/A", street: "N/A", city: "N/A", state: "N/A", zipcode: "N/A", beds: "N/A", baths: "N/A", type: "N/A" },
-                    agentDetails: { name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A", listedBy: "N/A" }
+                    agentDetails: { name: "N/A", broker: "N/A", phone: "N/A", brokerPhone: "N/A", email: "N/A", listedBy: listedByText }
                 };
-
-                // Extract "Listed by" from DOM
-                const listedByHeader = document.querySelector('[data-testid="listing-agent-header"]');
-                if (listedByHeader) {
-                    data.agentDetails.listedBy = listedByHeader.textContent.trim();
-                }
 
                 const nextDataScript = document.querySelector('script#__NEXT_DATA__');
                 if (!nextDataScript) return data;
@@ -168,7 +179,7 @@ async function runScraper() {
                 }
 
                 return data;
-            });
+            }, listedByText); // Pass the extracted text into the evaluate function
 
             const finalUrl = extractedData.canonicalUrl || originalUrl;
 
